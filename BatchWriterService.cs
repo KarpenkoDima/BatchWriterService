@@ -1,66 +1,93 @@
 void Main()
-{
-	/*
-using Polly;
+{ }
+/*using Polly;
 using Polly.Retry;
 */
-
 public sealed class BatchWriterSevice : BackgroundService
 {
 
 	private readonly LogChannel _channel;
 	private readonly ILogRepository _repository;
 	private readonly ILogger<BatchWriterService> _logger;
-
-	private const int BatchSize = 500;
+	private readonly LogCollectorOptions _options; // Добалвяем опции
+	private readonly AsyncRetryPolicy _retryPolicy;
 
 	public BatchWriterSevice(
 		LogChannel channel,
 		ILogRepository repository,
-		ILogger<BatchWriterService> logger)
+		ILogger<BatchWriterService> logger,
+		IOptions<LogCollectorOptions> options)
 	{
 		_channel = channel;
 		_logger = logger;
 		_repository = repository;
-	}
+		_options = options.Value;
 
-	private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
-
-	// Inside your class
-	private readonly AsyncRetryPolicy _retryPolicy = Policy
-		.Handle<Exception>(ex => IsTransient(ex)) // Only retry on "fixable" errors
-		.WaitAndRetryAsync(3, retryAttempt =>
+		_retryPolicy = Policy
+			.Handle<Exception>(ex => IsTransient(ex)) // Only retry on "fixable" errors
+			.WaitAndRetryAsync(
+			retryCount: 3,
+			sleepDurationProvider: retryAttempt =>
 			TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), // Exponential backoff: 2s, 4s, 8s
-			(exception, timeSpan, retryCount, context) =>
+			onRetry: (exception, timeSpan, retryCount, context) =>
 			{
 				// Log a warning so you know retries are happening
-				// _logger.LogWarning("Retry {Count} due to {Message}", retryCount, exception.Message);
+				_logger.LogWarning("Retry {Count} due to {Message}", retryCount, exception.Message);
 			});
+	}
+
 
 	private static bool IsTransient(Exception ex)
 	{
-		// You'd typically check for SQL timeout or Network errors here
-		// For now, let's assume all exceptions except critical ones are retryable
-		return ex is not InvalidOperationException;
+		// Более детальная проверка на временные ошибки, например для SQL Server и сетевых ошибок.
+		// Здесь можно добавить другие типы исключений, характерные для вашего хранилища данных.
+		if (ex is SqlException sqlEx)
+		{
+			// Transient SQL error codes (e.g., timeout, deadlock victim, network issues)
+			// https://docs.microsoft.com/en-us/azure/azure-sql/database/troubleshoot-vnet-connectivity#transient-errors
+			var transientSqlErrorCodes = new[] { 4060, 40197, 40501, 40613, 49918, 49919, 49920, 11001 };
+			if (transientSqlErrorCodes.Contains(sqlEx.Number)
+			{
+				return true;
+			}
+		}
+
+		if (ex is SocketException || ex is HttpRequestException)
+		{
+			return true; // Временные ошибки сети
+		}
+		if (ex is OperationCanceledException)
+		{
+			return false; // Отмена операции не является временной ошибкой для ретрая
+		}
+		// По умолчанию не считаем ошибку временной, если нет явного указания
+		return false;
 	}
+
+
 
 	protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 	{
-		var batch = new List<LogEntry>(BatchSize);
+		var batch = new List<LogEntry>(_options.BatchSize);
 
 		while (false == stoppingToken.IsCancellationRequested)
 		{
-			using var timeoutCts = new CancellationTokenSource(FlushInterval);
+			// Создаем CTS для таймаута сброса (Linger) для каждой итерации
+			using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.FlushInterval));
 			using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
 			try
 			{
-				await FillBatchAsync(batch, timeoutCts.Token);
+				await FillBatchAsync(batch, linkedCts.Token); // Используем linkedCts.Token для сбора
 			}
 			catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
 			{
+				// Приложение завершает работу, выходим из цикла
 				break; ;
 			}
-			catch (OperationCanceledException) {/*Timer hit, proceed to flush */}
+			catch (OperationCanceledException)
+			{
+				// Сработал таймаут сбора батча (linger timeout), продолжаем к попытке сброса того, что собрали
+			}
 
 			if (batch.Count > 0)
 			{
@@ -70,24 +97,23 @@ public sealed class BatchWriterSevice : BackgroundService
 					await _retryPolicy.ExecuteAsync(async (ct) =>
 					{
 						await _repository.InsertBatchAsync(batch, ct);
-					}, linkedCts.Token);
+					}, stoppingToken);// Запись в БД с Retry-политикой, используя ГЛОБАЛЬНЫЙ stoppingToken
 
 					_logger.LogInformation("Successfully flushed {Count} entries", batch.Count);
+					batch.Clear(); // Очищаем батч только после успешной записи
 				}
 				catch (Exception ex)
 				{
 					_logger.LogCritical(ex, "FATAL: Batch failed after retries. Moving to Dead Letter Store.");
 					await MoveToDeadLetterAsync(batch);
+					batch.Clear(); // Очищаем батч после попытки перемещения в DLQ
 				}
-				finally
-				{
-					//batch.Clear();
-				}
+
 			}
 		}
-		// Финальный flush при graceful shutdown
-		await DrainRemainingAsync(batch, stoppingToken);
-
+			
+			// Финальный flush при graceful shutdown
+			await DrainRemainingAsync(batch, stoppingToken);
 	}
 
 	private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)
@@ -100,54 +126,80 @@ public sealed class BatchWriterSevice : BackgroundService
 
 		if (batch.Count > 0)
 		{
-			// чтобі не зависла на всегда запись в хранилище
+			// чтобы не зависла на всегда запись в хранилище
 			using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-			cts.CancelAfter(FlushInterval);
-			await _repository.InsertBatchAsync(batch, cts.Token);
-			_logger.LogInformation("Final flush {Count} entries", batch.Count);
+			cts.CancelAfter(TimeSpan.FromSeconds(_options.FlushInterval));
+			try
+			{
+				await _repository.InsertBatchAsync(batch, cts.Token);
+				_logger.LogInformation("Final flush {Count} entries", batch.Count);
+			}
+			catch (OperationCanceledException)
+			{
+				_logger.LogWarning("Финальный сьрос был отменён");
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Ошибка при финальном сбросе логов. Перемещение в DLQ");
+				await MoveToDeadLetterAsync(batch);
+			}
+			finally
+			{
+				batch.Clear(); // Очищаем батч после финального сброса или DLQ
+			}
 		}
 	}
 
 	async Task FillBatchAsync(List<LogEntry> batch, CancellationToken token)
 	{
-		// Ждём хотя бы один элемент, чтобы не крутить цил в холостую
-		var entry = await _channel.Reader.ReadAsync(token);
-		batch.Add(entry);
-
-		using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-		cts.CancelAfter(FlushInterval);
-
-		while (batch.Count < BatchSize && false == cts.Token.IsCancellationRequested)
+		try
 		{
-			if (false == _channel.Reader.TryRead(out entry))
+			// Ждём хотя бы один элемент, чтобы не крутить цил в холостую
+			var entry = await _channel.Reader.ReadAsync(token);
+			batch.Add(entry);
+
+			using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+			cts.CancelAfter(TimeSpan.FromSeconds(_options.FlushInterval));
+
+			while (batch.Count < _options.BatchSize && false == cts.Token.IsCancellationRequested)
 			{
-				// Канал пуст прямо сейчас — ждём немного или до таймаута  
-				try
+				if (false == _channel.Reader.TryRead(out entry))
 				{
-					await _channel.Reader.WaitToReadAsync(cts.Token);
+					// Канал пуст прямо сейчас — ждём немного или до таймаута  
+					try
+					{
+						await _channel.Reader.WaitToReadAsync(cts.Token);
+					}
+					catch (OperationCanceledException ex)
+					{
+						_logger.LogDebug("Таймаут сбора батча истек. Отправляем неполный батч.");
+						break; // FlushInterval истёк — отправляем неполный батч  
+					}
 				}
-				catch (OperationCanceledException ex)
+				else
 				{
-					break; // FlushInterval истёк — отправляем неполный батч  
+					batch.Add(entry);
 				}
-			}
-			else
-			{
-				batch.Add(entry);
 			}
 		}
-
+		catch (OperationCanceledException)
+		{
+			// Нормальное поведение при отмене: батч, собранный на данный момент, остается в списке
+		}
+		catch (ChannelClosedException ex)
+		{
+			_logger.LogWarning("Канал был закрыт во время чтения.");
+		}
 	}
 
 	Task MoveToDeadLetterAsync(List<LogEntry> batch)
 	{
-		// В случае неудач записываем либо в лог либо в файл несохраненные 
-		// после всех попыток очищаем
-		batch.Clear();
-		throw new NotImplementedException();
-	}
+		_logger.LogCritical("Реализуйте логику сохранения {Count} логов в Dead Letter Store.", batch.Count);
+		// В случае неудач записываем либо в лог, либо в файл несохраненные логи
+		// Это место для вашей реальной реализации DLQ
+		return Task.CompletedTask; // Заглушка
+	}	
 }
-
 
 /// <summary>
 /// Централизованная точка доступа к in-process шине сообщений.
@@ -198,6 +250,9 @@ public sealed class LogEntry
 	public string? Hostname { get; init; }
 }
 
+// пример класса опций (нужно создать в проекте)
+public class LogCollectorOptions
+{
+	public int BatchSize { get; set; }=500;
+	public double FlushInterval { get; set; }=5; // seconds
 }
-
-// You can define other methods, fields, classes and namespaces here
