@@ -3,7 +3,10 @@ void Main()
 /*using Polly;
 using Polly.Retry;
 */
-public sealed class BatchWriterSevice : BackgroundService
+
+using System.Threading.Tasks
+;
+public sealed class BatchWriterService : BackgroundService
 {
 
 	private readonly LogChannel _channel;
@@ -12,7 +15,9 @@ public sealed class BatchWriterSevice : BackgroundService
 	private readonly LogCollectorOptions _options; // Добалвяем опции
 	private readonly AsyncRetryPolicy _retryPolicy;
 
-	public BatchWriterSevice(
+	private CancellationTokenSource _cts = new CancellationTokenSource();
+
+	public BatchWriterService(
 		LogChannel channel,
 		ILogRepository repository,
 		ILogger<BatchWriterService> logger,
@@ -46,7 +51,7 @@ public sealed class BatchWriterSevice : BackgroundService
 			// Transient SQL error codes (e.g., timeout, deadlock victim, network issues)
 			// https://docs.microsoft.com/en-us/azure/azure-sql/database/troubleshoot-vnet-connectivity#transient-errors
 			var transientSqlErrorCodes = new[] { 4060, 40197, 40501, 40613, 49918, 49919, 49920, 11001 };
-			if (transientSqlErrorCodes.Contains(sqlEx.Number)
+			if (transientSqlErrorCodes.Contains(sqlEx.Number))
 			{
 				return true;
 			}
@@ -65,16 +70,24 @@ public sealed class BatchWriterSevice : BackgroundService
 	}
 
 
-
 	protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 	{
 		var batch = new List<LogEntry>(_options.BatchSize);
 
+		if (false == _cts.TryReset())
+		{
+			_cts.Dispose();
+			_cts = new CancellationTokenSource();
+		}
+
+		_cts.CancelAfter(TimeSpan.FromMilliseconds(_options.FlushInterval));
+		var token = _cts.Token;
+
 		while (false == stoppingToken.IsCancellationRequested)
 		{
 			// Создаем CTS для таймаута сброса (Linger) для каждой итерации
-			using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.FlushInterval));
-			using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
+			//using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.FlushInterval));
+			using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, token);
 			try
 			{
 				await FillBatchAsync(batch, linkedCts.Token); // Используем linkedCts.Token для сбора
@@ -82,7 +95,7 @@ public sealed class BatchWriterSevice : BackgroundService
 			catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
 			{
 				// Приложение завершает работу, выходим из цикла
-				break; ;
+				break;
 			}
 			catch (OperationCanceledException)
 			{
