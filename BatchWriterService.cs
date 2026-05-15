@@ -15,8 +15,10 @@ public sealed class BatchWriterService : BackgroundService
 	private readonly LogCollectorOptions _options; // Добалвяем опции
 	private readonly AsyncRetryPolicy _retryPolicy;
 
-	private CancellationTokenSource _cts = new CancellationTokenSource();
-
+	private volatile CancellationTokenSource _cts = new CancellationTokenSource();
+	// Вариант Б — читать через Interlocked в коде
+	// if (Interlocked.CompareExchange(ref _cts, null, null) is null)
+			// break;
 	public BatchWriterService(
 		LogChannel channel,
 		ILogRepository repository,
@@ -76,6 +78,10 @@ public sealed class BatchWriterService : BackgroundService
      
 		while (false == stoppingToken.IsCancellationRequested)
 		{
+			if (_cts is null) // volatile-поле: гарантирует видимость записи из Dispose()
+            {
+				break;
+			}
             // Размещение логики сброса(Linger):
             // В текущем коде сброс и установка CancelAfter происходят до цикла while.
             // Это означает, что таймер сработает один раз для первого батча, и после этого токен
@@ -106,8 +112,11 @@ public sealed class BatchWriterService : BackgroundService
 			{
 				// Сработал таймаут сбора батча (linger timeout), продолжаем к попытке сброса того, что собрали
 			}
-
-			if (batch.Count > 0)
+            catch (ChannelClosedException)
+            {
+                break;
+            }
+            if (batch.Count > 0)
 			{
 				await FlushWithRetryAsync(batch, stoppingToken);
 			}
@@ -197,7 +206,7 @@ public sealed class BatchWriterService : BackgroundService
 					{
 						await _channel.Reader.WaitToReadAsync(token);
 					}
-					catch (OperationCanceledException ex)
+					catch (OperationCanceledException)
 					{
 						_logger.LogDebug("Таймаут сбора батча истек. Отправляем неполный батч.");
 						break; // FlushInterval истёк — отправляем неполный батч  
@@ -214,9 +223,10 @@ public sealed class BatchWriterService : BackgroundService
 		{
 			// Нормальное поведение при отмене: батч, собранный на данный момент, остается в списке
 		}*/
-		catch (ChannelClosedException ex)
+		catch (ChannelClosedException)
 		{
 			_logger.LogWarning("Канал был закрыт во время чтения.");
+			throw;
 		}
 	}
 
@@ -230,7 +240,7 @@ public sealed class BatchWriterService : BackgroundService
 
     public override void Dispose()
     {
-        _cts.Dispose();
+        Interlocked.Exchange(ref _cts, null)?.Dispose();
         base.Dispose();
     }
 }
