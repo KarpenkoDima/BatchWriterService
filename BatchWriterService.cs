@@ -73,21 +73,26 @@ public sealed class BatchWriterService : BackgroundService
 	protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 	{
 		var batch = new List<LogEntry>(_options.BatchSize);
-
-		if (false == _cts.TryReset())
-		{
-			_cts.Dispose();
-			_cts = new CancellationTokenSource();
-		}
-
-		_cts.CancelAfter(TimeSpan.FromMilliseconds(_options.FlushInterval));
-		var token = _cts.Token;
-
+     
 		while (false == stoppingToken.IsCancellationRequested)
 		{
-			// Создаем CTS для таймаута сброса (Linger) для каждой итерации
-			//using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.FlushInterval));
-			using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, token);
+            // Размещение логики сброса(Linger):
+            // В текущем коде сброс и установка CancelAfter происходят до цикла while.
+            // Это означает, что таймер сработает один раз для первого батча, и после этого токен
+            // останется в состоянии отмены навсегда.
+            // Логика обновления таймера должна находиться внутри цикла,
+            // чтобы каждый новый батч имел свой интервал ожидания(linger timeout).
+            // переиспользование одного CTS с изменением времени отмены.
+            // 1. Обновляем или пересоздаем CTS внутри цикла для каждого батча
+            if (false == _cts.TryReset())
+            {
+                _cts.Dispose();
+                _cts = new CancellationTokenSource();
+            }
+            // 2. Устанавливаем таймаут (допустим, в секундах, как в опциях)
+            _cts.CancelAfter(_options.FlushInterval);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _cts.Token);
+
 			try
 			{
 				await FillBatchAsync(batch, linkedCts.Token); // Используем linkedCts.Token для сбора
@@ -104,24 +109,7 @@ public sealed class BatchWriterService : BackgroundService
 
 			if (batch.Count > 0)
 			{
-				try
-				{
-					// Wrap the call in our Polly policy
-					await _retryPolicy.ExecuteAsync(async (ct) =>
-					{
-						await _repository.InsertBatchAsync(batch, ct);
-					}, stoppingToken);// Запись в БД с Retry-политикой, используя ГЛОБАЛЬНЫЙ stoppingToken
-
-					_logger.LogInformation("Successfully flushed {Count} entries", batch.Count);
-					batch.Clear(); // Очищаем батч только после успешной записи
-				}
-				catch (Exception ex)
-				{
-					_logger.LogCritical(ex, "FATAL: Batch failed after retries. Moving to Dead Letter Store.");
-					await MoveToDeadLetterAsync(batch);
-					batch.Clear(); // Очищаем батч после попытки перемещения в DLQ
-				}
-
+				await FlushWithRetryAsync(batch, stoppingToken);
 			}
 		}
 			
@@ -129,7 +117,33 @@ public sealed class BatchWriterService : BackgroundService
 			await DrainRemainingAsync(batch, stoppingToken);
 	}
 
-	private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)
+	private async Task FlushWithRetryAsync(List<LogEntry> batch, CancellationToken ct)
+	{
+        try
+        {
+            // Wrap the call in our Polly policy
+            await _retryPolicy.ExecuteAsync(async (token) =>
+            {
+                await _repository.InsertBatchAsync(batch, token);
+            }, ct);// Запись в БД с Retry-политикой, используя ГЛОБАЛЬНЫЙ stoppingToken
+
+            _logger.LogInformation("Successfully flushed {Count} entries", batch.Count);
+            //batch.Clear(); // Очищаем батч только после успешной записи
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex, "FATAL: Batch failed after retries. Moving to Dead Letter Store.");
+            await MoveToDeadLetterAsync(batch);
+            //batch.Clear(); // Очищаем батч после попытки перемещения в DLQ
+        }
+		finally
+		{
+			batch.Clear();
+		}
+
+    }
+
+    private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)
 	{
 
 		while (_channel.Reader.TryRead(out var entry))
@@ -141,7 +155,7 @@ public sealed class BatchWriterService : BackgroundService
 		{
 			// чтобы не зависла на всегда запись в хранилище
 			using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-			cts.CancelAfter(TimeSpan.FromSeconds(_options.FlushInterval));
+			cts.CancelAfter(_options.FlushInterval);
 			try
 			{
 				await _repository.InsertBatchAsync(batch, cts.Token);
@@ -171,17 +185,17 @@ public sealed class BatchWriterService : BackgroundService
 			var entry = await _channel.Reader.ReadAsync(token);
 			batch.Add(entry);
 
-			using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-			cts.CancelAfter(TimeSpan.FromSeconds(_options.FlushInterval));
+			/*using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+			cts.CancelAfter(TimeSpan.FromSeconds(_options.FlushInterval));*/
 
-			while (batch.Count < _options.BatchSize && false == cts.Token.IsCancellationRequested)
+			while (batch.Count < _options.BatchSize && false ==token.IsCancellationRequested)
 			{
 				if (false == _channel.Reader.TryRead(out entry))
 				{
 					// Канал пуст прямо сейчас — ждём немного или до таймаута  
 					try
 					{
-						await _channel.Reader.WaitToReadAsync(cts.Token);
+						await _channel.Reader.WaitToReadAsync(token);
 					}
 					catch (OperationCanceledException ex)
 					{
@@ -195,10 +209,11 @@ public sealed class BatchWriterService : BackgroundService
 				}
 			}
 		}
-		catch (OperationCanceledException)
+		/* Убрал ибо есть внутри с break 
+		 * catch (OperationCanceledException)
 		{
 			// Нормальное поведение при отмене: батч, собранный на данный момент, остается в списке
-		}
+		}*/
 		catch (ChannelClosedException ex)
 		{
 			_logger.LogWarning("Канал был закрыт во время чтения.");
@@ -211,7 +226,13 @@ public sealed class BatchWriterService : BackgroundService
 		// В случае неудач записываем либо в лог, либо в файл несохраненные логи
 		// Это место для вашей реальной реализации DLQ
 		return Task.CompletedTask; // Заглушка
-	}	
+	}
+
+    public override void Dispose()
+    {
+        _cts.Dispose();
+        base.Dispose();
+    }
 }
 
 /// <summary>
@@ -267,5 +288,5 @@ public sealed class LogEntry
 public class LogCollectorOptions
 {
 	public int BatchSize { get; set; }=500;
-	public double FlushInterval { get; set; }=5; // seconds
+	public TimeSpan FlushInterval { get; set; }= TimeSpan.FromSeconds(5); // чтобы избежать двусмысленности
 }
