@@ -52,13 +52,19 @@ public sealed class BatchWriterService : BackgroundService
 		{
 			// Transient SQL error codes (e.g., timeout, deadlock victim, network issues)
 			// https://docs.microsoft.com/en-us/azure/azure-sql/database/troubleshoot-vnet-connectivity#transient-errors
-			var transientSqlErrorCodes = new[] { 4060, 40197, 40501, 40613, 49918, 49919, 49920, 11001 };
-			if (transientSqlErrorCodes.Contains(sqlEx.Number))
+			switch(sqlEx.Number)
 			{
-				return true;
+				case 4060: 
+				case 40197: 
+				case 40501: 
+				case 40613: 
+				case 49918: 
+				case 49919: 
+				case 49920: 
+				case 11001:
+					return true; 
 			}
 		}
-
 		if (ex is SocketException || ex is HttpRequestException)
 		{
 			return true; // Временные ошибки сети
@@ -131,10 +137,10 @@ public sealed class BatchWriterService : BackgroundService
         try
         {
             // Wrap the call in our Polly policy
-            await _retryPolicy.ExecuteAsync(async (token) =>
+            await _retryPolicy.ExecuteAsync(async (localBatch, token) =>
             {
-                await _repository.InsertBatchAsync(batch, token);
-            }, ct);// Запись в БД с Retry-политикой, используя ГЛОБАЛЬНЫЙ stoppingToken
+                await _repository.InsertBatchAsync(localBatch, token);
+            }, batch, ct);// Запись в БД с Retry-политикой, используя ГЛОБАЛЬНЫЙ stoppingToken
 
             _logger.LogInformation("Successfully flushed {Count} entries", batch.Count);
             //batch.Clear(); // Очищаем батч только после успешной записи
